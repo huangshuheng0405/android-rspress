@@ -18,5 +18,10 @@
     "type": "file",
     "name": "network",
     "label": "Network"
+  },
+  {
+    "type": "file",
+    "name": "navigation",
+    "label": "Navigation"
   }
 ]

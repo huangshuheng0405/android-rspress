@@ -1,0 +1,181 @@
+# Navigation
+
+`Navigation Compose` 是 Navigation 组件在 Jetpack Compose 中的实现。没有 Fragment、没有 XML 导航图:**每个页面是一个 `@Composable`,导航图用 Kotlin 代码声明**。
+
+| 概念                | 作用                                                         |
+| ------------------- | ------------------------------------------------------------ |
+| `NavController`     | 控制导航:`navigate()`、`popBackStack()` 等,通过 `rememberNavController()` 创建 |
+| `NavHost`           | 导航容器,根据当前返回栈栈顶显示对应页面                      |
+| `NavGraph`          | 由 `NavHost` 的 lambda 里 `composable<T>{}` 声明的路由集合   |
+| `NavBackStackEntry` | 返回栈中的一条记录,持有该页面的参数、生命周期、ViewModel 作用域 |
+
+## 添加依赖
+
+```kotlin
+// build.gradle.kts (module)
+plugins {
+    id("org.jetbrains.kotlin.plugin.serialization") // 类型安全路由需要
+}
+
+dependencies {
+    implementation("androidx.navigation:navigation-compose:$nav_version") // 建议 2.8.0+
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:$serialization_version")
+}
+```
+
+## 基本用法
+
+Navigation 2.8.0 起,路由可以直接用 `@Serializable` 的对象或数据类表示,取代以前的字符串拼接。
+
+定义路由
+
+```kotlin
+@Serializable object Home                          // 无参数页面用 object
+@Serializable data class Detail(val itemId: Int)   // 有参数用 data class
+@Serializable object Settings
+```
+
+搭建NavHost
+
+```kotlin
+@Composable
+fun AppNavHost() {
+    val navController = rememberNavController()
+
+    NavHost(navController = navController, startDestination = Home) {
+
+        composable<Home> {
+            HomeScreen(
+                onItemClick = { id -> navController.navigate(Detail(itemId = id)) },
+                onSettingsClick = { navController.navigate(Settings) }
+            )
+        }
+
+        composable<Detail> { backStackEntry ->
+            val detail: Detail = backStackEntry.toRoute()
+            DetailScreen(
+                itemId = detail.itemId,
+                onBack = { navController.popBackStack() }
+            )
+        }
+
+        composable<Settings> {
+            SettingsScreen(onBack = { navController.popBackStack() })
+        }
+    }
+}
+```
+
+在 Activity 中使用
+
+```kotlin
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent {
+            MaterialTheme { AppNavHost() }
+        }
+    }
+}
+```
+
+常用导航操作
+
+```kotlin
+navController.navigate(Detail(1))        // 跳转
+navController.popBackStack()             // 返回上一页
+navController.navigateUp()               // 向上导航
+
+// 回到指定页面
+navController.popBackStack<Home>(inclusive = false)
+
+// 跳转时配置返回栈
+navController.navigate(Home) {
+    popUpTo<Login> { inclusive = true }  // 登录成功后清除登录页
+    launchSingleTop = true               // 栈顶已是该页面时不重复创建
+}
+```
+
+### 参数传递
+
+简单参数直接放进路由
+
+```kotlin
+@Serializable data class Detail(val itemId: Int, val title: String? = null)
+```
+
+支持基本类型、String、枚举、`@Serializable` 类型以及它们的列表等。可选参数给默认值即可。
+
+在ViewModel中读取参数
+
+```kotlin
+@HiltViewModel
+class DetailViewModel @Inject constructor(
+    savedStateHandle: SavedStateHandle,
+    private val repo: ItemRepository
+) : ViewModel() {
+
+    private val route = savedStateHandle.toRoute<Detail>()
+
+    val item = repo.observeItem(route.itemId)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
+}
+```
+
+## 底部导航栏
+
+```kotlin
+@Serializable object HomeTab
+@Serializable object SearchTab
+@Serializable object ProfileTab
+
+data class TabItem<T : Any>(val label: String, val route: T, val icon: ImageVector)
+
+@Composable
+fun MainScreen() {
+    val navController = rememberNavController()
+    val tabs = listOf(
+        TabItem("首页", HomeTab, Icons.Default.Home),
+        TabItem("搜索", SearchTab, Icons.Default.Search),
+        TabItem("我的", ProfileTab, Icons.Default.Person),
+    )
+
+    Scaffold(
+        bottomBar = {
+            NavigationBar {
+                val backStackEntry by navController.currentBackStackEntryAsState()
+                val destination = backStackEntry?.destination
+
+                tabs.forEach { tab ->
+                    NavigationBarItem(
+                        selected = destination?.hasRoute(tab.route::class) == true,
+                        onClick = {
+                            navController.navigate(tab.route) {
+                                popUpTo(navController.graph.findStartDestination().id) {
+                                    saveState = true      // 保存离开 Tab 的状态
+                                }
+                                launchSingleTop = true    // 避免重复入栈
+                                restoreState = true       // 恢复之前保存的状态
+                            }
+                        },
+                        icon = { Icon(tab.icon, contentDescription = tab.label) },
+                        label = { Text(tab.label) }
+                    )
+                }
+            }
+        }
+    ) { padding ->
+        NavHost(
+            navController = navController,
+            startDestination = HomeTab,
+            modifier = Modifier.padding(padding)
+        ) {
+            composable<HomeTab> { HomeScreen() }
+            composable<SearchTab> { SearchScreen() }
+            composable<ProfileTab> { ProfileScreen() }
+        }
+    }
+}
+```
+
+`saveState` + `restoreState` + `launchSingleTop` 这三个配置是底部导航的标配,实现"每个 Tab 保留自己的状态和滚动位置"。
