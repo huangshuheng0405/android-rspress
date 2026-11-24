@@ -1,0 +1,151 @@
+# ViewModel
+
+`ViewModel`是Android Jetpack架构组件，用来**存放和管理与UI相关的数据**，并在**配置变更（屏幕旋转、语言切换、深色模式切换）时保留数据**
+
+主要解决两个问题
+
+1. **配置变更导致数据丢失**:Activity 在旋转屏幕时会被销毁重建,放在 Activity 里的成员变量会丢失。
+2. **职责混乱**:把网络请求、数据处理、UI 逻辑全塞进 Activity/Fragment,会导致代码臃肿、难以测试。
+
+## 生命周期
+
+ViewModel 的生命周期比 Activity/Fragment 更长:
+
+```
+Activity.onCreate()  ──► 创建 ViewModel
+   │
+   │  屏幕旋转 → Activity 销毁重建
+   │  ViewModel 依然存活(同一个实例)
+   ▼
+Activity.finish() / 用户真正退出
+   │
+   ▼
+ViewModel.onCleared()  ──► ViewModel 被销毁
+```
+
+关键点:ViewModel 的作用域(`ViewModelStoreOwner`)结束时才会调用 `onCleared()`,你可以在里面释放资源。
+
+> 注意:**进程被系统杀死时 ViewModel 也会丢失**,这时需要用 `SavedStateHandle` 或持久化存储。
+
+## 基本语法
+
+定义ViewModel（配合StateFlow）
+
+```kotlin
+class CounterViewModel : ViewModel() {
+
+    private val _count = MutableStateFlow(0)
+    val count: StateFlow<Int> = _count.asStateFlow()
+
+    fun increment() {
+        _count.value += 1
+    }
+}
+```
+
+在Activity/Fragment中获取
+
+```kotlin
+class MainActivity : AppCompatActivity() {
+
+    // 使用 androidx.activity 的委托
+    private val viewModel: CounterViewModel by viewModels()
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.count.collect { value ->
+                    textView.text = value.toString()
+                }
+            }
+        }
+
+        button.setOnClickListener { viewModel.increment() }
+    }
+}
+```
+
+在Jetpack Compose中
+
+```kotlin
+@Composable
+fun CounterScreen(viewModel: CounterViewModel = viewModel()) {
+    val count by viewModel.count.collectAsStateWithLifecycle()
+
+    Button(onClick = { viewModel.increment() }) {
+        Text("Count: $count")
+    }
+}
+```
+
+### 带参数的ViewModel
+
+构造函数有参数时，需要`ViewModelProvider.Factory`：
+
+```kotlin
+class UserViewModel(private val repo: UserRepository) : ViewModel() { ... }
+
+class UserViewModelFactory(private val repo: UserRepository)
+    : ViewModelProvider.Factory {
+    override fun <T : ViewModel> create(modelClass: Class<T>): T {
+        return UserViewModel(repo) as T
+    }
+}
+
+// 使用
+val viewModel: UserViewModel by viewModels { UserViewModelFactory(repo) }
+```
+
+实际项目中更常用到Hilt简化：
+
+```kotlin
+@HiltViewModel
+class UserViewModel @Inject constructor(
+    private val repo: UserRepository
+) : ViewModel()
+
+// Activity/Fragment 上加 @AndroidEntryPoint 即可
+private val viewModel: UserViewModel by viewModels()
+```
+
+### viewModelScope
+
+ViewModel自带`viewModelScope`，在ViewModel被清楚时自动取消协程，避免内存泄漏
+
+```kotlin
+class NewsViewModel(private val repo: NewsRepository) : ViewModel() {
+
+    private val _uiState = MutableStateFlow<UiState>(UiState.Loading)
+    val uiState: StateFlow<UiState> = _uiState
+
+    init { loadNews() }
+
+    private fun loadNews() {
+        viewModelScope.launch {
+            _uiState.value = try {
+                UiState.Success(repo.getNews())
+            } catch (e: Exception) {
+                UiState.Error(e.message)
+            }
+        }
+    }
+}
+
+sealed interface UiState {
+    object Loading : UiState
+    data class Success(val data: List<News>) : UiState
+    data class Error(val msg: String?) : UiState
+}
+```
+
+### 数据持有
+
+|              | LiveData   | StateFlow                                                  |
+| ------------ | ---------- | ---------------------------------------------------------- |
+| 来源         | Jetpack    | Kotlin 协程                                                |
+| 生命周期感知 | 自带       | 需配合 `repeatOnLifecycle` / `collectAsStateWithLifecycle` |
+| 初始值       | 可无       | 必须有                                                     |
+| 操作符       | 较少       | 丰富(map、combine、debounce 等)                            |
+| 推荐度       | 老项目常见 | **新项目推荐**                                             |

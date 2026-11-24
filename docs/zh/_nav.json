@@ -12,5 +12,10 @@
   {
     "text": "文档",
     "link": "https://rspress.rs/"
+  },
+  {
+    "text": "Android",
+    "link": "/android/",
+    "activeMatch": "/android/"
   }
 ]

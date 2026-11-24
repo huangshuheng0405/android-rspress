@@ -1,0 +1,22 @@
+[
+  {
+    "type": "file",
+    "name": "index",
+    "label": "Android 概览"
+  },
+  {
+    "type": "file",
+    "name": "compose",
+    "label": "Compose"
+  },
+  {
+    "type": "file",
+    "name": "viewModel",
+    "label": "ViewModel"
+  },
+  {
+    "type": "file",
+    "name": "network",
+    "label": "Network"
+  }
+]

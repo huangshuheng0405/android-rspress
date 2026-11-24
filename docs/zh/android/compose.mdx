@@ -1,0 +1,217 @@
+# Compose
+
+Compose是声明式：你写一个函数，描述当数据是X时，界面是这样。数据变了，Compose重新执行这个函数，把界面更新到新描述的样子。
+
+也就是说**Composable函数会被反复执行**
+
+## @Composable
+
+```kotlin
+@Composable
+fun Greeting(name: String) {
+    Text("Hello, $name")
+}
+```
+
+- 不返回UI对象
+- 它可以被其他`@Composable`调用，形成树状结构，`Text()`本身也是一个`@Composbale`函数
+- 它应该是纯的、无副作用的，不要在 Composable 里直接发网络请求、写数据库、改全局变量。这些副作用要用 `LaunchedEffect`、`DisposableEffect` 等专门 API 处理。
+- 命名：Composable函数用大驼峰，和普通函数区分开
+
+## Recomposition
+
+重组，当Composable读取的状态发生变化时，Compose会**重新执行**读取了该状态的Comosable函数，用新的数据重新描述界面。
+
+```kotlin
+@Composable
+fun Counter() {
+    var count by remember { mutableIntStateOf(0) }
+    Text("$count")                          // 读取了 count
+    Button(onClick = { count++ }) { Text("+1") }
+}
+```
+
+重组是智能的
+
+Compose会尽量只重组读取了变化状态的那些Composable。通过一种叫**位置记忆**的机制，跳过没有变化的子树，所以Compose的性能会比较好
+
+## State
+
+如果没有状态，普通局部变量在函数每次执行时都会重新初始化，重组时值就丢了
+
+```kotlin
+@Composable
+fun BadCounter() {
+    var count = 0          // 每次重组都变回 0
+    Button(onClick = { count++ }) { Text("$count") }  // 永远显示 0
+}
+```
+
+`remember`：**让一个值在多次重组之间被记住**
+
+```kotlin
+var count by remember { mutableIntStateOf(0) }
+```
+
+- `mutableIntStateOf(0)` 创建一个**可观察的 Int 状态**，初始值 0。它实现了 `MutableState<Int>`，当 `.value` 变化时，Compose 知道“有东西变了”。
+- `remember { ... }` 让这个状态对象在重组之间存活。没有 `remember`，每次重组都会创建一个新的状态对象，旧的值就丢了。
+- `by` 是 Kotlin 属性委托，让你能写 `count++` 而不是 `count.value++`。`getValue`/`setValue` 操作的是状态对象的 `.value`。
+
+`mutableStateOf` vs `mutableIntStateOf`
+
+- `mutableStateOf(0)` 返回 `MutableState<Int>`，是通用写法。
+- `mutableIntStateOf(0)` 是专门为基本类型优化的版本，避免装箱。Int、Long、Float、Double、Boolean 都有对应的专用版本。**新代码推荐用专用版本**。
+
+`remember`，只在重组之间保留，配置变更（旋转屏幕）时Activity重建，`remember`会丢，`rememberSaveable`不会
+
+```kotlin
+var count by rememberSaveable { mutableIntStateOf(0) }
+```
+
+这种只适合**少量、可序列化**的状态。大量状态或复杂对象应该放到ViewModel里
+
+## 布局
+
+基础容器
+
+```kotlin
+Column {          // 垂直排列
+    Text("A")
+    Text("B")
+}
+
+Row {             // 水平排列
+    Text("A")
+    Text("B")
+}
+
+Box {             // 层叠，后写的盖在上面
+    Image(...)
+    Text("水印")
+}
+```
+
+它们都接收 `modifier`、`horizontalAlignment`、`verticalArrangement` 等参数来控制子元素对齐。
+
+```kotlin
+Column(
+    modifier = Modifier.fillMaxSize().padding(16.dp),
+    horizontalAlignment = Alignment.CenterHorizontally,  // 水平居中
+    verticalArrangement = Arrangement.Center            // 垂直居中
+) { ... }
+```
+
+`Modifier` 是 Compose 里设置尺寸、内边距、背景、点击、边框等的统一方式。它是**链式调用**，且要注意顺序
+
+```kotlin
+Modifier
+    .fillMaxWidth()        // 宽度撑满
+    .padding(16.dp)        // 内边距
+    .background(Color.Gray) // 背景
+    .clickable { ... }     // 可点击
+```
+
+**顺序很重要**：`padding` 在 `background` 之前和之后，视觉效果不同。`padding(16.dp).background(...)` 是“先留白再涂背景”，背景不覆盖留白区域；`background(...).padding(16.dp)` 是“先涂背景再留白”，背景覆盖整个区域。
+
+常用属性
+
+| Modifier                                               | 作用       |
+| :----------------------------------------------------- | :--------- |
+| `fillMaxSize()` / `fillMaxWidth()` / `fillMaxHeight()` | 撑满父容器 |
+| `size(100.dp)` / `width(...)` / `height(...)`          | 固定尺寸   |
+| `padding(16.dp)`                                       | 内边距     |
+| `background(Color.Red)`                                | 背景色     |
+| `clickable { }`                                        | 点击事件   |
+| `border(1.dp, Color.Gray, RoundedCornerShape(8.dp))`   | 边框       |
+| `clip(RoundedCornerShape(8.dp))`                       | 裁剪圆角   |
+
+## 尺寸
+
+- **`dp`**：密度无关像素，用于尺寸、间距、边距。不同屏幕密度下视觉大小一致。
+- **`sp`**：缩放无关像素，用于**文字大小**。它会跟随用户系统字体大小设置缩放。
+
+```kotlin
+Text("Hello", fontSize = 18.sp)
+Spacer(Modifier.height(16.dp))
+```
+
+## 列表
+
+普通`Column`会一次性组合所有子项，数据多了会卡。列表用`LazyColumn`，只组合**当前可见的项**，滚动时回收和复用
+
+```kotlin
+LazyColumn(
+    contentPadding = PaddingValues(16.dp),
+    verticalArrangement = Arrangement.spacedBy(8.dp)
+) {
+    item {
+        Text("头部")
+    }
+    items(userList, key = { it.id }) { user ->
+        UserRow(user)
+    }
+}
+```
+
+- `item { }`：单个非列表项。
+- `items(list, key = { ... }) { item -> }`：列表项。**给 `key` 很重要**，它帮助 Compose 在数据变化时正确识别和复用项，避免状态错乱。
+- `contentPadding`：内容内边距，列表滚到边缘时仍然有留白。
+- `verticalArrangement = Arrangement.spacedBy(8.dp)`：项之间的统一间距，比每项自己加 padding 更干净。
+
+## 副作用
+
+Composable会被反复执行，所以**不能在函数体里直接做副作用**（发请求、写数据库、弹Toast、启动协程）
+
+### LaunchedEffect
+
+进入时执行一次，或key变化时重新执行
+
+```kotlin
+@Composable
+fun UserScreen(userId: String, viewModel: UserViewModel) {
+    LaunchedEffect(userId) {
+        viewModel.load(userId)   // userId 变化时重新加载
+    }
+}
+```
+
+`LaunchedEffect` 的协程和 Composable 的生命周期绑定：Composable 离开组合树时，协程自动取消。key 变化时，旧协程取消，新协程启动。
+
+### DisposableEffect
+
+需要清理的副作用
+
+```kotlin
+DisposableEffect(lifecycleOwner) {
+    val observer = LifecycleEventObserver { _, event -> ... }
+    lifecycleOwner.lifecycle.addObserver(observer)
+    onDispose {
+        lifecycleOwner.lifecycle.removeObserver(observer)
+    }
+}
+```
+
+注册监听器、打开资源这类需要成对操作的事情用它。
+
+### SideEffect
+
+每次成功重组后执行
+
+```kotlin
+SideEffect {
+    // 每次重组成功后调用，适合把 Compose 状态同步给非 Compose 系统
+}
+```
+
+### rememberCoroutineScope
+
+需要手动启动协程
+
+```kotlin
+val scope = rememberCoroutineScope()
+Button(onClick = {
+    scope.launch { /* 点击触发的协程 */ }
+}) { Text("加载") }
+```
+
+点击事件里启动协程用这个，它的生命周期和 Composable 绑定。
