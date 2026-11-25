@@ -1,0 +1,221 @@
+# 本地存储
+
+| 方案                  | 适合存什么                                 | 特点                                             |
+| --------------------- | ------------------------------------------ | ------------------------------------------------ |
+| **DataStore**         | 设置项、开关、少量键值数据                 | 协程/Flow、异步、事务安全,替代 SharedPreferences |
+| **Room**              | 结构化、有关系的数据(列表、缓存、离线数据) | SQLite 封装,编译期检查 SQL,支持 Flow             |
+| **文件存储**          | 图片、音视频、JSON、下载文件               | 分内部存储和外部存储                             |
+| **SharedPreferences** | 老项目的键值数据                           | 已不推荐新项目使用                               |
+| **Android Keystore**  | 密钥、令牌等敏感数据的加密                 | 密钥存放在系统安全区,不可导出                    |
+
+## DataStore
+
+### 依赖
+
+```kotlin
+implementation("androidx.datastore:datastore-preferences:$datastore_version")
+```
+
+### 基本用法
+
+这里以Todo为例子
+
+```kotlin title="TodoPreference.kt"
+// 第1步：给 TodoItem 加 @Serializable 注解
+@Serializable
+data class TodoItem(
+    val id: String = java.util.UUID.randomUUID().toString(),
+    val text: String,
+    val isDone: Boolean = false
+)
+
+// 第2步：创建 DataStore 操作类
+class TodoPreferences(context: Context) {
+    private val dataStore = context.dataStore
+
+    // JSON 解析器（第8讲学的）
+    private val json = Json { ignoreUnknownKeys = true }
+
+    // 定义 Key：存 JSON 字符串
+    private val TODO_KEY = stringPreferencesKey("todo_list")
+
+    /** 保存待办列表 → 序列化成 JSON → 存入 DataStore */
+    suspend fun saveTodos(todos: List<TodoItem>) {
+        val jsonStr = json.encodeToString(ListSerializer(TodoItem.serializer()), todos)
+        dataStore.edit { it[TODO_KEY] = jsonStr }
+    }
+
+    /** 从 DataStore 读取 JSON → 反序列化成 List<TodoItem> */
+    suspend fun loadTodos(): List<TodoItem> {
+        return dataStore.data.map { prefs ->
+            val jsonStr = prefs[TODO_KEY] ?: ""
+            if (jsonStr.isEmpty()) emptyList()
+            else json.decodeFromString(ListSerializer(TodoItem.serializer()), jsonStr)
+        }.first()
+    }
+}
+```
+
+- `@Serializable` → 让 TodoItem 支持 JSON 序列化（第8讲学的）
+- `json.encodeToString(ListSerializer(TodoItem.serializer()), todos)` → 把列表转成 JSON 字符串，如 `[{"id":"1","text":"买菜","isDone":false}]`
+- `json.decodeFromString(ListSerializer(TodoItem.serializer()), jsonStr)` → 把 JSON 字符串转回 `List<TodoItem>`
+- `stringPreferencesKey("todo_list")` → 创建字符串类型的 Key，类似 Map 的键
+- `dataStore.edit { it[TODO_KEY] = jsonStr }` → 修改数据，`it` 是可编辑的 Preferences 对象
+- `dataStore.data` → 返回 `Flow<Preferences>`，数据变化时自动通知
+- `.first()` → 取 Flow 的第一个值（suspend 函数，需要在协程中调用）
+
+### ViewModel
+
+接入ViewModel
+
+```kotlin title="TodoViewModel.kt"
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.compose.viewModel
+
+class TodoViewModel(application: Application) : AndroidViewModel(application) {
+    // UI 状态：待办列表（第7讲学的 StateFlow）
+    private val _todos = MutableStateFlow<List<TodoItem>>(emptyList())
+    val todos = _todos.asStateFlow()
+
+    // DataStore 操作类
+    private val preferences = TodoPreferences(application)
+
+    init {
+        // App 启动时从 DataStore 加载待办列表
+        viewModelScope.launch {
+            _todos.value = preferences.loadTodos()
+        }
+    }
+
+    /** 保存到 DataStore */
+    private fun saveToDataStore(todos: List<TodoItem>) {
+        viewModelScope.launch {
+            preferences.saveTodos(todos)
+        }
+    }
+
+    /** 添加待办 */
+    fun addTodo(text: String) {
+        val newTodo = TodoItem(text = text)
+        val updated = _todos.value + newTodo
+        _todos.value = updated
+        saveToDataStore(updated)
+    }
+
+    /** 切换完成状态 */
+    fun toggleTodo(id: String) {
+        val updated = _todos.value.map {
+            if (it.id == id) it.copy(isDone = !it.isDone) else it
+        }
+        _todos.value = updated
+        saveToDataStore(updated)
+    }
+
+    /** 删除待办 */
+    fun deleteTodo(id: String) {
+        val updated = _todos.value.filter { it.id != id }
+        _todos.value = updated
+        saveToDataStore(updated)
+    }
+}
+```
+
+- `init { }` → ViewModel 创建时自动执行，从 DataStore 加载之前保存的待办
+- 每次增删改后都调用 `saveToDataStore(updated)` → **立即持久化**，不怕 App 崩溃或重启
+- `_todos.value + newTodo` → 列表拼接，返回新列表（Kotlin 列表不可变，每次操作返回新列表）
+- `AndroidViewModel(application)` → 需要 Context 来创建 TodoPreferences，所以用 AndroidViewModel 而非 ViewModel
+
+### UI
+
+静态页面
+
+```kotlin
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun TodoScreen(viewModel: TodoViewModel = viewModel()) {
+    val todos by viewModel.todos.collectAsState()  // ← 从 ViewModel 获取状态
+    var inputText by remember { mutableStateOf("") }
+
+    Scaffold { padding ->
+        Column(modifier = Modifier.fillMaxSize().padding(padding).padding(16.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OutlinedTextField(
+                    value = inputText,
+                    onValueChange = { inputText = it },
+                    label = { Text("输入待办事项") },
+                    singleLine = true,
+                    modifier = Modifier.weight(1f)
+                )
+                Button(
+                    onClick = {
+                        if (inputText.isNotBlank()) {
+                            viewModel.addTodo(inputText.trim())  // ← 改为调 ViewModel
+                            inputText = ""
+                        }
+                    }
+                ) { Text("添加") }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(todos, key = { it.id }) { todo ->
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Checkbox(
+                                checked = todo.isDone,
+                                onCheckedChange = { viewModel.toggleTodo(todo.id) }  // ← ViewModel
+                            )
+                            Text(
+                                text = todo.text,
+                                modifier = Modifier.weight(1f),
+                                textDecoration = if (todo.isDone)
+                                    TextDecoration.LineThrough else TextDecoration.None,
+                                color = if (todo.isDone) Color.Gray else Color.Black
+                            )
+                            IconButton(onClick = { viewModel.deleteTodo(todo.id) }) {  // ← ViewModel
+                                Icon(Icons.Default.Close, contentDescription = "删除")
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (todos.isEmpty()) {
+                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text("还没有待办，添加一个吧！", color = Color.Gray)
+                }
+            }
+        }
+    }
+}
+```
+
+- `val todos by viewModel.todos.collectAsState()` → 从 ViewModel 获取状态，替代 `remember`
+- `viewModel.addTodo(...)` → 调用 ViewModel 方法，替代直接修改 `remember` 状态
+- ViewModel 内部自动持久化到 DataStore，UI 不用关心存储细节
+
+验证：添加几个待办 -> 关闭App -> 重新打开 -> 待办列表还在，说明数据已经持久化到本地了
+
+## Room
+
+| 特性       | DataStore                        | Room                           |
+| ---------- | -------------------------------- | ------------------------------ |
+| 数据类型   | 键值对（简单类型 + JSON 字符串） | 关系型（表、行、列）           |
+| 查询能力   | 只能按 Key 读取                  | 支持 SQL 查询、排序、条件过滤  |
+| 数据量     | 少量数据（配置、Token）          | 大量数据（聊天记录、文章列表） |
+| 复杂关系   | 不支持                           | 支持多表关联                   |
+| 学习成本   | 低                               | 中等（需学 SQL + 注解）        |
+| 面试通适用 | ✅ 用户信息、搜索历史             | 不需要（数据量小）             |

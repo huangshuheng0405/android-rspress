@@ -23,5 +23,10 @@
     "type": "file",
     "name": "navigation",
     "label": "Navigation"
+  },
+  {
+    "type": "file",
+    "name": "store",
+    "label": "Store"
   }
 ]
