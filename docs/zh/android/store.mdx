@@ -10,13 +10,289 @@
 
 ## DataStore
 
-### 依赖
+`DataStore`是Jetpack提供的**异步、事务安全的小数据存储方案**，用来代替`SharedPreferences`。它基于**Kotlin协程+Flow**，数据以文件形式保存在应用私有目录（`files/datastore`）
+
+适合存放：
+
+- 用户设置（深色模式、语言、字体大小）
+- 登录状态标志、引导页是否已看过
+- 少量清理数据
+
+**不合适**存放：大量数据、需要查询/排序/关联的数据、高频写入的数据，这些用Room
+
+两种类型
+
+|                  | Preferences DataStore | Proto DataStore                    |
+| ---------------- | --------------------- | ---------------------------------- |
+| 数据形式         | 键值对                | 自定义数据类(强类型)               |
+| 是否需要定义结构 | 不需要                | 需要(Protobuf 或自定义 Serializer) |
+| 类型安全         | 靠 Key 的类型约束     | 编译期强类型                       |
+| 适合             | 零散的简单设置        | 结构化的一组设置对象               |
+| 上手难度         | 低                    | 中                                 |
+
+### Preferences DataStore
+
+比较常用
+
+#### 依赖
 
 ```kotlin
 implementation("androidx.datastore:datastore-preferences:$datastore_version")
 ```
 
-### 基本用法
+#### 创建实例
+
+用属性委托，声明在文件顶层：
+
+```kotlin
+val Context.settingsDataStore: DataStore<Preferences> by preferencesDataStore(name = "settings")
+```
+
+`name = "settings"` 会生成文件 `/data/data/<包名>/files/datastore/settings.preferences_pb`。
+
+> 重点:**同一个文件在同一进程里只能有一个 DataStore 实例**,否则会抛 `IllegalStateException`。用顶层委托或依赖注入单例就能保证这点。
+
+#### 定义Key
+
+Key是带类型的，不同类型用不同工厂函数：
+
+```kotlin
+object PrefKeys {
+    val DARK_MODE = booleanPreferencesKey("dark_mode")
+    val USERNAME = stringPreferencesKey("username")
+    val LAUNCH_COUNT = intPreferencesKey("launch_count")
+    val LAST_SYNC = longPreferencesKey("last_sync")
+    val FONT_SCALE = floatPreferencesKey("font_scale")
+    val TAGS = stringSetPreferencesKey("tags")
+}
+```
+
+支持的类型:`Int`、`Long`、`Float`、`Double`、`Boolean`、`String`、`Set<String>`。**不支持自定义对象和 List**,需要的话要自己转成 JSON 字符串存,不过这种情况更推荐用 Proto DataStore 或 Room。
+
+#### 读取
+
+`dataStore.data`是一个`Flow<Preferences>`，每次数据变化都会重新发射：
+
+```kotlin
+val darkModeFlow: Flow<Boolean> = context.settingsDataStore.data
+    .catch { e ->
+        // 读文件出错时给默认值,而不是让 Flow 崩溃
+        if (e is IOException) emit(emptyPreferences()) else throw e
+    }
+    .map { prefs -> prefs[PrefKeys.DARK_MODE] ?: false }
+```
+
+只想读一次当前值：
+
+```kotlin
+val current = context.settingsDataStore.data.first()[PrefKeys.DARK_MODE] ?: false
+```
+
+>  注意:不要用 `runBlocking` 在主线程里读 DataStore,首次读取要加载磁盘文件,会卡顿甚至 ANR。
+
+#### 写入
+
+`edit`是挂起函数，在内部自动切换到IO线程，**整个修改是原子事务**
+
+```kotlin
+suspend fun setDarkMode(enabled: Boolean) {
+    context.settingsDataStore.edit { prefs ->
+        prefs[PrefKeys.DARK_MODE] = enabled
+    }
+}
+
+// 同时改多个值,要么全成功要么全失败
+context.settingsDataStore.edit { prefs ->
+    prefs[PrefKeys.USERNAME] = "Tom"
+    prefs[PrefKeys.LAUNCH_COUNT] = (prefs[PrefKeys.LAUNCH_COUNT] ?: 0) + 1
+}
+
+// 删除
+context.settingsDataStore.edit { it.remove(PrefKeys.USERNAME) }
+context.settingsDataStore.edit { it.clear() }
+```
+
+`edit` 的 lambda 里读到的是当前最新值,所以"读取-修改-写入"这类计数操作是**线程安全**的,这是比 SharedPreferences 好的地方。
+
+
+
+
+
+
+
+
+
+### Proto DataStore
+
+当你有一组结构化设置时,用它比散落的 Key 更清晰。官方原生支持 Protobuf,但也可以用 **Kotlin Serialization(JSON)** 自定义 `Serializer`,不用学 `.proto`,更轻量。
+
+#### 依赖
+
+```kotlin
+implementation("androidx.datastore:datastore:$datastore_version")
+implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:$serialization_version")
+// 并启用 kotlin-serialization 插件
+```
+
+#### 定义数据类和Serialize
+
+```kotlin
+@Serializable
+data class UserSettings(
+    val darkMode: Boolean = false,
+    val language: String = "zh",
+    val fontScale: Float = 1f,
+    val favoriteIds: List<Int> = emptyList()    // 支持 List,Preferences 版做不到
+)
+
+object UserSettingsSerializer : Serializer<UserSettings> {
+
+    override val defaultValue: UserSettings = UserSettings()
+
+    override suspend fun readFrom(input: InputStream): UserSettings =
+        try {
+            Json.decodeFromString(
+                UserSettings.serializer(),
+                input.readBytes().decodeToString()
+            )
+        } catch (e: SerializationException) {
+            throw CorruptionException("无法读取 UserSettings", e)
+        }
+
+    override suspend fun writeTo(t: UserSettings, output: OutputStream) {
+        output.write(
+            Json.encodeToString(UserSettings.serializer(), t).encodeToByteArray()
+        )
+    }
+}
+```
+
+读取出错时抛 `CorruptionException`,配合 `corruptionHandler` 可以重置回默认值。
+
+#### 创建与使用
+
+```kotlin
+val Context.userSettingsStore: DataStore<UserSettings> by dataStore(
+    fileName = "user_settings.json",
+    serializer = UserSettingsSerializer
+)
+```
+
+```kotlin
+// 读:data 直接就是 UserSettings
+val settingsFlow: Flow<UserSettings> = context.userSettingsStore.data
+
+// 写:updateData,不可变对象用 copy
+suspend fun setDarkMode(enabled: Boolean) {
+    context.userSettingsStore.updateData { it.copy(darkMode = enabled) }
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Room
+
+| 特性       | DataStore                        | Room                           |
+| ---------- | -------------------------------- | ------------------------------ |
+| 数据类型   | 键值对（简单类型 + JSON 字符串） | 关系型（表、行、列）           |
+| 查询能力   | 只能按 Key 读取                  | 支持 SQL 查询、排序、条件过滤  |
+| 数据量     | 少量数据（配置、Token）          | 大量数据（聊天记录、文章列表） |
+| 复杂关系   | 不支持                           | 支持多表关联                   |
+| 学习成本   | 低                               | 中等（需学 SQL + 注解）        |
+| 面试通适用 | ✅ 用户信息、搜索历史             | 不需要（数据量小）             |
+
+## 存储位置
+
+### 整体结构
+
+Android基于Linux，分为几个区域
+
+```
+/data                          ← userdata 分区(用户数据区)
+ ├─ /data/data/<包名>/         ← 应用私有目录(内部存储)
+ ├─ /data/user/0/<包名>/       ← 同上(实际路径,/data/data 是它的链接)
+ └─ /data/media/0/             ← 共享存储的真实位置
+
+/storage/emulated/0/           ← 用户看到的"手机存储"(共享存储)
+/sdcard                        ← 指向上面的快捷方式
+```
+
+### 应用私有目录
+
+路径:`/data/data/<包名>/`(多用户时为 `/data/user/<用户ID>/<包名>/`)
+
+```
+/data/data/com.example.app/
+ ├─ files/            ← context.filesDir
+ ├─ cache/            ← context.cacheDir
+ ├─ databases/        ← Room / SQLite 数据库文件
+ │    ├─ app.db
+ │    ├─ app.db-wal   ← 预写日志
+ │    └─ app.db-shm
+ ├─ shared_prefs/     ← SharedPreferences 的 XML 文件
+ │    └─ old_prefs.xml
+ └─ datastore/        ← DataStore 文件
+      └─ settings.preferences_pb
+```
+
+对于关系：
+
+| 方案                    | 实际文件                                                     |
+| ----------------------- | ------------------------------------------------------------ |
+| Room                    | `databases/xxx.db`(SQLite 文件)                              |
+| DataStore (Preferences) | `files/datastore/xxx.preferences_pb`(Protobuf 二进制)。注意是在 `files/` 下 |
+| DataStore (Proto)       | `files/datastore/` 下你指定的文件名                          |
+| SharedPreferences       | `shared_prefs/xxx.xml`                                       |
+| `filesDir` / `cacheDir` | `files/`、`cache/`                                           |
+
+要点:
+
+- 每个应用在系统里有独立的 Linux 用户 ID(UID),这个目录的权限只属于该 UID,所以别的应用**读不了**。这就是"沙箱隔离"。
+- 卸载应用或用户点"清除数据"时,整个目录被删除。
+
+### 共享存储
+
+路径:`/storage/emulated/0/`,例如:
+
+```
+/storage/emulated/0/
+ ├─ DCIM/          ← 相机照片
+ ├─ Pictures/      ← 图片
+ ├─ Download/      ← 下载
+ ├─ Documents/
+ ├─ Music/
+ └─ Android/data/  ← 各应用的外部专属目录
+```
+
+MediaStore 写入的图片、视频就落在这里。卸载应用后**不会删除**。
+
+
+
+
+
+## 案例
 
 这里以Todo为例子
 
@@ -208,14 +484,3 @@ fun TodoScreen(viewModel: TodoViewModel = viewModel()) {
 - ViewModel 内部自动持久化到 DataStore，UI 不用关心存储细节
 
 验证：添加几个待办 -> 关闭App -> 重新打开 -> 待办列表还在，说明数据已经持久化到本地了
-
-## Room
-
-| 特性       | DataStore                        | Room                           |
-| ---------- | -------------------------------- | ------------------------------ |
-| 数据类型   | 键值对（简单类型 + JSON 字符串） | 关系型（表、行、列）           |
-| 查询能力   | 只能按 Key 读取                  | 支持 SQL 查询、排序、条件过滤  |
-| 数据量     | 少量数据（配置、Token）          | 大量数据（聊天记录、文章列表） |
-| 复杂关系   | 不支持                           | 支持多表关联                   |
-| 学习成本   | 低                               | 中等（需学 SQL + 注解）        |
-| 面试通适用 | ✅ 用户信息、搜索历史             | 不需要（数据量小）             |

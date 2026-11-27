@@ -1,242 +1,184 @@
 # Network
 
-## OkHttp
+网络请求主流组合：
 
-Retrofit底层用的就是OkHttp。通常不需要你直接调OkHttp，只需要对其进行一些配置
+| 组件         | 职责                                                       |
+| ------------ | ---------------------------------------------------------- |
+| **OkHttp**   | 底层 HTTP 客户端:连接池、超时、重试、缓存、拦截器          |
+| **Retrofit** | 在 OkHttp 之上,把 HTTP 接口声明成 Kotlin 接口              |
+| **序列化库** | JSON ↔ Kotlin 对象:Kotlin Serialization(推荐)、Moshi、Gson |
+| **协程**     | Retrofit 原生支持 `suspend` 函数,请求结果直接返回          |
 
-核心能力
-
-- **连接池**：复用 TCP 连接，减少握手开销。
-- **超时控制**：连接超时、读超时、写超时。
-- **拦截器（Interceptor）**：在请求发出前和响应返回后插入逻辑。
-- **缓存**：基于 HTTP 缓存头（`Cache-Control`、`ETag`）缓存响应。
-- **自动重试**：连接失败时自动重试其他路由（不是业务重试）。
-- **HTTP/2、TLS**：现代协议支持。
-
-典型配置
-
-```kotlin
-val okHttpClient = OkHttpClient.Builder()
-    .connectTimeout(10, TimeUnit.SECONDS)   // 建立连接超时
-    .readTimeout(15, TimeUnit.SECONDS)      // 读取响应超时
-    .writeTimeout(15, TimeUnit.SECONDS)     // 写入请求体超时
-    .cache(Cache(cacheDir, 50L * 1024 * 1024)) // 50MB 磁盘缓存
-    .addInterceptor(loggingInterceptor)      // 应用拦截器
-    .addNetworkInterceptor(cacheInterceptor) // 网络拦截器
-    .build()
+```
+Repository
+   │ 调用 suspend 函数
+   ▼
+Retrofit 接口 (NoteApi)       ← 声明有哪些请求
+   │
+   ▼
+OkHttp (拦截器、超时、缓存)    ← 真正发请求
+   │
+   ▼
+服务器
 ```
 
-**OkHttpClient 应该是单例**。它内部有连接池和线程池，每次 `new` 一个会浪费资源。用 Hilt 的 `@Singleton` 或手动单例持有。
+## 权限
 
-## Retrofit
+```kotlin title="AndroidManifest.xml"
+<uses-permission android:name="android.permission.INTERNET" />
+<!-- 需要判断网络状态时再加 -->
+<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+```
 
-Retrofit的核心思想是**用接口描述API，用注解描述请求**
-
-基本写法
+## 依赖
 
 ```kotlin
-interface UserApi {
-    @GET("users/{id}")
-    suspend fun getUser(@Path("id") id: String): Response<UserDto>
+dependencies {
+    implementation("com.squareup.retrofit2:retrofit:$retrofit_version")
+    implementation("com.squareup.okhttp3:okhttp:$okhttp_version")
+    implementation("com.squareup.okhttp3:logging-interceptor:$okhttp_version")
 
-    @GET("users")
-    suspend fun getUsers(
-        @Query("page") page: Int = 1,
-        @Query("limit") limit: Int = 20
-    ): Response<UserListDto>
-
-    @POST("users")
-    suspend fun createUser(@Body body: CreateUserRequest): Response<UserDto>
-
-    @PUT("users/{id}")
-    suspend fun updateUser(
-        @Path("id") id: String,
-        @Body body: UpdateUserRequest
-    ): Response<UserDto>
-
-    @DELETE("users/{id}")
-    suspend fun deleteUser(@Path("id") id: String): Response<Unit>
+    // JSON:Kotlin Serialization(需启用 kotlin-serialization 插件)
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:$serialization_version")
+    // Retrofit 与 Kotlin Serialization 的转换器,
+    // 新版 Retrofit 官方已提供 converter-kotlinx-serialization,
+    // 旧版用 Jake Wharton 的 retrofit2-kotlinx-serialization-converter,请以官方文档为准
+    implementation("com.squareup.retrofit2:converter-kotlinx-serialization:$retrofit_version")
 }
 ```
 
-常用注解
+**明文HTTP**
 
-| 注解                                             | 用途                     | 示例                                     |
-| :----------------------------------------------- | :----------------------- | :--------------------------------------- |
-| `@GET` / `@POST` / `@PUT` / `@DELETE` / `@PATCH` | HTTP 方法                | `@GET("users")`                          |
-| `@Path`                                          | 替换 URL 中的 `{占位符}` | `@Path("id") id: String`                 |
-| `@Query`                                         | 拼接查询参数             | `@Query("page") page: Int`               |
-| `@QueryMap`                                      | 多个查询参数             | `@QueryMap params: Map<String, String>`  |
-| `@Body`                                          | 请求体（自动序列化）     | `@Body user: UserDto`                    |
-| `@Header` / `@Headers`                           | 请求头                   | `@Header("Authorization") token: String` |
-| `@FormUrlEncoded` + `@Field`                     | 表单提交                 | `@Field("username") name: String`        |
-| `@Multipart` + `@Part`                           | 文件上传                 | `@Part file: MultipartBody.Part`         |
-| `@Url`                                           | 动态完整 URL             | `@Url url: String`                       |
+Android 9+ 默认**禁止明文 HTTP**,只允许 HTTPS。开发期连本地服务器需要在 `network_security_config` 中单独放行,**正式版请一律用 HTTPS**。
 
-对于返回类型
+## 基本用法
 
-```kotlin
-// 方案 A：返回 Response<T>，能拿到状态码
-suspend fun getUser(id: String): Response<UserDto>
-
-// 方案 B：返回裸 T，非 2xx 直接抛 HttpException
-suspend fun getUser(id: String): UserDto
-```
-
-原因：
-
-- 能判断 `isSuccessful`，区分 HTTP 错误和网络异常。
-- 能拿到 `code()`、`message()`、`headers()`，便于精细处理。
-- 方案 B 遇到 4xx/5xx 会抛 `HttpException`，你需要额外 catch 才能区分错误类型，不如 `Response` 直接。
-
-## 序列化
-
-Retrofit本身不解析JSON，它通过`ConverterFactory`委托给序列化库
-
-| 库                        | 特点                                              | 推荐度       |
-| :------------------------ | :------------------------------------------------ | :----------- |
-| **kotlinx.serialization** | Kotlin 官方，编译期生成序列化器，支持 KMP，无反射 | 新项目首选   |
-| **Moshi**                 | Square 出品，支持反射和代码生成，Kotlin 友好      | 成熟项目常用 |
-| **Gson**                  | 老牌，反射实现，对 Kotlin 空安全支持差            | 不推荐新项目 |
-
-这里以`kotlinx.serialization`为例
+第一步：定于数据模型（DTO）
 
 ```kotlin
 @Serializable
-data class UserDto(
+data class NoteDto(
     val id: Long,
-    val name: String,
-    @SerialName("avatar_url") val avatarUrl: String? = null
+    val title: String,
+    @SerialName("body") val content: String,       // JSON 字段名与属性名不同时用 SerialName
+    @SerialName("created_at") val createdAt: Long,
+    val tags: List<String> = emptyList()            // 给默认值,字段缺失时不崩溃
 )
+
+@Serializable
+data class CreateNoteRequest(val title: String, val body: String)
 ```
 
-- `@Serializable`：编译期生成序列化器。
-- `@SerialName`：字段名映射，解决后端下划线命名和 Kotlin 驼峰命名的差异。
-- **可空字段给默认值**：`= null`，后端不返回该字段时不会崩溃。
+第二步：定义接口
 
-配置 Converter
+```kotlin
+interface NoteApi {
+
+    @GET("notes")
+    suspend fun getNotes(
+        @Query("page") page: Int,
+        @Query("size") size: Int = 20
+    ): List<NoteDto>
+
+    @GET("notes/{id}")
+    suspend fun getNote(@Path("id") id: Long): NoteDto
+
+    @POST("notes")
+    suspend fun createNote(@Body request: CreateNoteRequest): NoteDto
+
+    @PUT("notes/{id}")
+    suspend fun updateNote(@Path("id") id: Long, @Body request: CreateNoteRequest): NoteDto
+
+    @DELETE("notes/{id}")
+    suspend fun deleteNote(@Path("id") id: Long)
+}
+```
+
+第三步：创建Retrofit实例
 
 ```kotlin
 val json = Json {
-    ignoreUnknownKeys = true   // 后端多返回字段时不崩溃
-    coerceInputValues = true   // null 转默认值
-    isLenient = true           // 宽松模式，容忍格式不严格
+    ignoreUnknownKeys = true      // 服务器多返回字段时不报错(强烈建议开启)
+    coerceInputValues = true      // null 对应非空且有默认值的属性时,使用默认值
 }
 
-Retrofit.Builder()
+val okHttpClient = OkHttpClient.Builder()
+    .connectTimeout(15, TimeUnit.SECONDS)
+    .readTimeout(30, TimeUnit.SECONDS)
+    .writeTimeout(30, TimeUnit.SECONDS)
+    .build()
+
+val retrofit = Retrofit.Builder()
+    .baseUrl("https://api.example.com/")          // 必须以 / 结尾
+    .client(okHttpClient)
     .addConverterFactory(json.asConverterFactory("application/json".toMediaType()))
     .build()
+
+val noteApi: NoteApi = retrofit.create(NoteApi::class.java)
 ```
 
-**`ignoreUnknownKeys = true` 几乎是必配的**。后端加字段很常见，不配这个，多一个字段就解析失败。
-
-## 错误处理
-
-```
-1. HTTP 错误：服务器返回 4xx / 5xx
-   - 401 未认证、403 无权限、404 不存在、500 服务器错误
-   - 响应体可能有业务错误码和消息
-
-2. 网络错误：请求没到达服务器或响应没回来
-   - 无网络、DNS 解析失败、连接超时、读超时
-   - 表现为 IOException 子类
-
-3. 解析错误：响应回来了但 JSON 结构不对
-   - 字段缺失、类型不匹配
-   - 表现为 SerializationException
-
-4. 业务错误：HTTP 200 但业务码表示失败
-   - 比如 { "code": 1001, "message": "余额不足" }
-   - 需要根据后端约定解析
-
-5. 协程取消：不是错误
-   - CancellationException
-   - 必须重新抛出，不能吞掉
-```
-
-统一结果类型
+第四步：调用
 
 ```kotlin
-sealed class ApiResult<out T> {
-    data class Success<T>(val data: T) : ApiResult<T>()
-    data class HttpError(val code: Int, val message: String?) : ApiResult<Nothing>()
-    data class NetworkError(val throwable: IOException) : ApiResult<Nothing>()
-    data class ParseError(val throwable: Throwable) : ApiResult<Nothing>()
-    data class UnknownError(val throwable: Throwable) : ApiResult<Nothing>()
+viewModelScope.launch {
+    val notes = noteApi.getNotes(page = 1)    // suspend:挂起等待,不阻塞主线程
+    ...
 }
 ```
 
-`safeApiCall`：把异常收口到一处
+**Retrofit 的 `suspend` 函数是主线程安全的**:内部已在 OkHttp 的线程池执行网络请求,你不需要再套 `withContext(Dispatchers.IO)`
+
+## with Hilt
 
 ```kotlin
-suspend inline fun <T> safeApiCall(
-    crossinline block: suspend () -> Response<T>
-): ApiResult<T> {
-    return try {
-        val response = block()
-        if (response.isSuccessful) {
-            val body = response.body()
-            if (body != null) ApiResult.Success(body)
-            else ApiResult.UnknownError(NullPointerException("响应体为空"))
-        } else {
-            ApiResult.HttpError(response.code(), response.message())
-        }
-    } catch (e: IOException) {
-        ApiResult.NetworkError(e)
-    } catch (e: CancellationException) {
-        throw e  // 必须重新抛出
-    } catch (e: Throwable) {
-        ApiResult.UnknownError(e)
-    }
-}
-```
+@Module
+@InstallIn(SingletonComponent::class)
+object NetworkModule {
 
-#### `CancellationException`为什么必须重新抛出
+    @Provides @Singleton
+    fun provideJson(): Json = Json { ignoreUnknownKeys = true; coerceInputValues = true }
 
-场景：用户进入页面 → 发起请求 → 用户立刻退出 → `viewModelScope` 被取消 → Retrofit 的 suspend 请求抛出 `CancellationException`。
-
-如果你把它当成普通错误吞掉：
-
-- 协程的取消信号丢失。
-- 后续代码可能继续执行，尝试更新已经销毁的 UI 状态。
-- 结构化并发被破坏，可能出现“页面已退出但请求还在跑”的泄漏。
-
-**规则：`catch (e: Throwable)` 之前必须先 `catch (e: CancellationException) { throw e }`**，或者用 `runCatching` 时注意它也会吞掉 `CancellationException`，需要手动检查。
-
-#### 处理业务错误码
-
-后端返回HTTP 200，但是响应体有业务码：
-
-```kotlin
-{ "code": 0, "message": "ok", "data": { ... } }
-{ "code": 1001, "message": "余额不足", "data": null }
-```
-
-方式A：在Repository层解包
-
-```kotlin
-@Serializable
-data class ApiResponse<T>(
-    val code: Int,
-    val message: String,
-    val data: T?
-)
-
-suspend fun fetchUser(id: String): ApiResult<User> {
-    return when (val result = safeApiCall { api.getUser(id) }) {
-        is ApiResult.Success -> {
-            val body = result.data
-            if (body.code == 0 && body.data != null) {
-                ApiResult.Success(body.data.toDomain())
-            } else {
-                ApiResult.BizError(body.code, body.message)
+    @Provides @Singleton
+    fun provideOkHttp(): OkHttpClient =
+        OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .apply {
+                if (BuildConfig.DEBUG) {
+                    addInterceptor(HttpLoggingInterceptor().apply {
+                        level = HttpLoggingInterceptor.Level.BODY
+                    })
+                }
             }
-        }
-        else -> result
-    }
+            .build()
+
+    @Provides @Singleton
+    fun provideRetrofit(client: OkHttpClient, json: Json): Retrofit =
+        Retrofit.Builder()
+            .baseUrl(BuildConfig.BASE_URL)
+            .client(client)
+            .addConverterFactory(json.asConverterFactory("application/json".toMediaType()))
+            .build()
+
+    @Provides @Singleton
+    fun provideNoteApi(retrofit: Retrofit): NoteApi = retrofit.create(NoteApi::class.java)
 }
 ```
 
-方式B：用OkHttp拦截器统一检测业务码
+注意:
 
-在拦截器里读响应体，如果业务码非 0 就抛自定义异常。但这种方式会消费响应体，需要重新构造 `Response` 返回，比较 tricky，不推荐新手用。**推荐方式 A**，逻辑清晰。
+- **OkHttpClient 和 Retrofit 必须是单例**。每个 `OkHttpClient` 都有自己的连接池和线程池,重复创建会浪费资源、降低性能。
+- **日志拦截器只在 Debug 打开**,`Level.BODY` 会把请求和响应内容(包括令牌、用户数据)全打到 Logcat,正式版绝不能开。
+
+## 响应与错误处理
+
+```kotlin
+// ① 直接返回 T:成功返回数据,失败(非 2xx / IO 错误)抛异常
+@GET("notes/{id}")
+suspend fun getNote(@Path("id") id: Long): NoteDto
+
+// ② 返回 Response<T>:不对 HTTP 错误抛异常,自己检查状态码
+@GET("notes/{id}")
+suspend fun getNoteResponse(@Path("id") id: Long): Response<NoteDto>
+```
+

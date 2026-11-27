@@ -1,0 +1,96 @@
+# CoroutineScope
+
+`CoroutineScope`(协程作用域)决定一个协程"归谁管":它负责追踪自己启动的所有协程,并在自己结束时把它们一起取消
+
+启动协程必须有 Scope,`launch` 和 `async` 本身就是 Scope 的扩展函数:
+
+```kotlin
+scope.launch { ... }
+scope.async { ... }
+```
+
+## Why
+
+假设没有Scope，协程到处都可以启动：
+
+```kotlin
+fun loadData() {
+    // 假设可以随意启动一个不受管理的协程
+    launchSomewhere {
+        val data = api.fetch()      // 耗时 10 秒
+        textView.text = data        // 用户早已退出页面,还去更新 UI
+    }
+}
+```
+
+问题：
+
+- 页面关了,任务还在后台跑,**浪费资源**。
+- 任务结束后试图操作已销毁的界面,**崩溃或内存泄漏**。
+- 没人知道有多少协程在跑,**无法统一取消**。
+
+有了 Scope:把协程挂在一个有生命周期的对象下,对象销毁时调用 `scope.cancel()`,名下所有协程随之取消
+
+## 内部构成
+
+Scope 本质上只包含一个东西:**`CoroutineContext`**,其中最关键的是 `Job`
+
+```kotlin
+public interface CoroutineScope {
+    public val coroutineContext: CoroutineContext
+}
+```
+
+- **`Job`**:代表生命周期,取消 Scope 就是取消这个 Job,子协程的 Job 都挂在它下面。
+- **`Dispatcher`**:协程默认在哪个线程跑。
+- 其他元素(名称、异常处理器等)。
+
+所以自己创建Scope很简单：
+
+```kotlin
+val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+scope.launch { ... }
+scope.cancel()          // 取消所有子协程
+```
+
+子协程会继承父Scope的上下文，并可局部覆盖：
+
+```kotlin
+viewModelScope.launch {                  // 继承 Main
+    withContext(Dispatchers.IO) { ... }  // 局部切到 IO
+}
+```
+
+## Android 中常用的 Scope
+
+| Scope                               | 绑定对象                         | 何时取消                  | 默认调度器       |
+| ----------------------------------- | -------------------------------- | ------------------------- | ---------------- |
+| `viewModelScope`                    | ViewModel                        | `onCleared()`             | `Main.immediate` |
+| `lifecycleScope`                    | Activity / Fragment 的 Lifecycle | 对应组件销毁(`DESTROYED`) | `Main.immediate` |
+| `viewLifecycleOwner.lifecycleScope` | Fragment 的 View                 | `onDestroyView()`         | `Main.immediate` |
+| `rememberCoroutineScope()`          | Compose 中的位置                 | 离开组合                  | Compose 的 Main  |
+| `LaunchedEffect`                    | Compose 副作用                   | key 变化或离开组合        | 同上             |
+| `GlobalScope`                       | 整个应用进程                     | 永不自动取消              | `Default`        |
+
+怎么选
+
+- 业务逻辑、数据加载 → `viewModelScope`(最常用)。ViewModel 在屏幕旋转时存活,所以旋转不会中断请求。
+- 与界面相关、随界面销毁而停止 → `lifecycleScope`。
+- Compose 中响应点击等事件(如弹 Snackbar、滚动列表) → `rememberCoroutineScope()`。
+- Compose 中"进入页面/某个值变化时自动执行" → `LaunchedEffect(key)`。
+- 必须跑完,不受页面影响(如上传、同步) → 应用级 Scope 或 WorkManager。
+
+```kotlin
+// ViewModel
+class MyViewModel : ViewModel() {
+    fun load() = viewModelScope.launch { ... }
+}
+
+// Compose:事件触发
+val scope = rememberCoroutineScope()
+Button(onClick = { scope.launch { listState.animateScrollToItem(0) } }) { Text("回到顶部") }
+
+// Compose:进入即执行
+LaunchedEffect(userId) { vm.load(userId) }
+```
+

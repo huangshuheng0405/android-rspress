@@ -1,4 +1,14 @@
 [
+    {
+    "text": "Android",
+    "link": "/android/",
+    "activeMatch": "/android/"
+  },
+  {
+    "text": "Kotlin",
+    "link": "/kotlin/",
+    "activeMatch": "/kotlin/"
+  },
   {
     "text": "指南",
     "link": "/guide/start/introduction",
@@ -12,10 +22,5 @@
   {
     "text": "文档",
     "link": "https://rspress.rs/"
-  },
-  {
-    "text": "Android",
-    "link": "/android/",
-    "activeMatch": "/android/"
   }
 ]

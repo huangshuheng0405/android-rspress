@@ -1,5 +1,7 @@
 import * as path from 'node:path';
 import { defineConfig } from '@rspress/core';
+import rehypeKatex from 'rehype-katex';
+import remarkMath from 'remark-math';
 
 export default defineConfig({
   root: path.join(__dirname, 'docs'),
@@ -25,6 +27,10 @@ export default defineConfig({
       description: '一个多语言 Rspress 文档站点。',
     },
   ],
+  markdown: {
+    remarkPlugins: [remarkMath],
+    rehypePlugins: [[rehypeKatex, { throwOnError: false }]],
+  },
   themeConfig: {
     socialLinks: [
       {

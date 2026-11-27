@@ -1,0 +1,125 @@
+## OkHttp
+
+**OkHttp 是 Square 开发的 HTTP 客户端库**,是 Android 上事实标准的网络底层。
+
+- 上一篇讲的 **Retrofit 底层就是 OkHttp**:Retrofit 负责"把接口声明变成请求",OkHttp 负责"真正把请求发出去、把响应收回来"。
+- 自带**连接池、HTTP/2、透明 GZIP 压缩、响应缓存、自动重试与重定向、TLS 支持**。
+- 通过**拦截器**机制可以统一扩展请求和响应的处理。
+- 4.x 起用 Kotlin 编写。
+
+## 核心对象
+
+| 对象                           | 作用                                             |
+| ------------------------------ | ------------------------------------------------ |
+| `OkHttpClient`                 | 客户端,持有配置、连接池、线程池,**应该全局单例** |
+| `Request`                      | 一次请求:URL、方法、Header、Body                 |
+| `Response`                     | 一次响应:状态码、Header、Body                    |
+| `Call`                         | 一次待执行/已执行的请求,可以取消                 |
+| `RequestBody` / `ResponseBody` | 请求体 / 响应体                                  |
+| `Interceptor`                  | 拦截器                                           |
+
+## 基本用法
+
+创建客户端（单例）
+
+```kotlin
+val client = OkHttpClient.Builder()
+    .connectTimeout(15, TimeUnit.SECONDS)
+    .readTimeout(30, TimeUnit.SECONDS)
+    .writeTimeout(30, TimeUnit.SECONDS)
+    .build()
+```
+
+### GET
+
+**同步:`execute()`**,会阻塞当前线程,**不能在主线程调用**:
+
+```kotlin
+val request = Request.Builder()
+    .url("https://api.example.com/notes")
+    .header("Accept", "application/json")
+    .build()
+
+client.newCall(request).execute().use { response ->     // use 会自动关闭 response
+    if (response.isSuccessful) {
+        val json = response.body?.string()
+    }
+}
+```
+
+**异步:`enqueue()`**,在 OkHttp 的线程池中执行,回调**不在主线程**:
+
+```kotlin
+client.newCall(request).enqueue(object : Callback {
+    override fun onFailure(call: Call, e: IOException) { /* 网络层失败 */ }
+
+    override fun onResponse(call: Call, response: Response) {
+        response.use {
+            val json = it.body?.string()
+            // 要更新 UI 必须自己切回主线程
+        }
+    }
+})
+```
+
+### POST
+
+```kotlin
+val body = """{"title":"a","body":"b"}"""
+    .toRequestBody("application/json; charset=utf-8".toMediaType())
+
+val request = Request.Builder()
+    .url("https://api.example.com/notes")
+    .post(body)
+    .build()
+```
+
+### Form And File
+
+```kotlin
+// 表单
+val form = FormBody.Builder()
+    .add("username", "tom")
+    .add("password", "123")
+    .build()
+
+// Multipart(文件上传)
+val multipart = MultipartBody.Builder()
+    .setType(MultipartBody.FORM)
+    .addFormDataPart("description", "头像")
+    .addFormDataPart("file", file.name, file.asRequestBody("image/*".toMediaType()))
+    .build()
+```
+
+## 在协程中使用
+
+OkHttp 的核心 API 是**阻塞式**(`execute`)和**回调式**(`enqueue`),不是 `suspend`。所以:
+
+- 如果用 **Retrofit**,它已经帮你封装成了 `suspend`,直接用即可。
+- 如果直接用 OkHttp,需要把回调转成挂起函数(协程篇讲过 `suspendCancellableCoroutine`):
+
+```kotlin
+suspend fun Call.await(): Response = suspendCancellableCoroutine { cont ->
+    enqueue(object : Callback {
+        override fun onResponse(call: Call, response: Response) {
+            cont.resume(response) { _, _, _ -> response.close() }   // 取消时关闭 response
+        }
+        override fun onFailure(call: Call, e: IOException) {
+            if (cont.isCancelled) return
+            cont.resumeWithException(e)
+        }
+    })
+    cont.invokeOnCancellation { cancel() }      // 协程取消时取消网络请求
+}
+```
+
+## 超时
+
+| 超时             | 含义                                   | 默认值    |
+| ---------------- | -------------------------------------- | --------- |
+| `connectTimeout` | 建立 TCP/TLS 连接的最长时间            | 10 秒     |
+| `readTimeout`    | 两次读取数据之间的最长间隔             | 10 秒     |
+| `writeTimeout`   | 两次写入数据之间的最长间隔             | 10 秒     |
+| `callTimeout`    | **整个请求**(从发起到读完响应)的总时限 | 0(不限制) |
+
+重点:`readTimeout` 是**两次数据到达之间的间隔**,不是整个下载的总时长,所以一个持续有数据的大文件下载不会触发它。需要给整个请求设上限,要用 `callTimeout`。

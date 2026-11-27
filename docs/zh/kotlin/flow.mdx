@@ -1,0 +1,165 @@
+# Kotlin Flow
+
+`Flow` 是 Kotlin 协程库(`kotlinx.coroutines`)提供的**异步数据流**:它可以**随时间推移,依次发出多个值**。
+
+对比一下：
+
+|                | 返回几个值        | 是否异步   | 例子                                   |
+| -------------- | ----------------- | ---------- | -------------------------------------- |
+| 普通函数       | 1 个              | 否(会阻塞) | `fun getUser(): User`                  |
+| `suspend` 函数 | 1 个              | 是         | `suspend fun getUser(): User`          |
+| `List`         | 多个,但一次性给齐 | 否         | `fun getUsers(): List<User>`           |
+| **Flow**       | **多个,陆续给出** | **是**     | `fun observeUsers(): Flow<List<User>>` |
+
+典型场景:
+
+- 数据库的数据变化时自动通知(Room、DataStore)
+- 倒计时、定时轮询
+- 搜索框输入的实时结果
+- WebSocket 消息、传感器数据
+- 把 UI 状态从 ViewModel 推送给界面
+
+安卓里的DataStore的`data`、Room的`observeAll()`、ViewModel的`StateFlow`，本质上都是Flow
+
+## 基本用法
+
+创建并收集
+
+```kotlin
+fun countdown(): Flow<Int> = flow {
+    for (i in 3 downTo 1) {
+        delay(1000)       // flow 里可以直接调用挂起函数
+        emit(i)           // 发出一个值
+    }
+}
+
+// 收集(消费)
+lifecycleScope.launch {
+    countdown().collect { value ->
+        println(value)    // 每隔 1 秒依次打印 3、2、1
+    }
+}
+```
+
+三个角色:
+
+- **生产者**:`flow { emit(x) }`,负责发出值
+- **中间操作符**:`map`、`filter` 等,加工数据
+- **消费者**:`collect`,真正接收数据
+
+创建Flow的常见方式
+
+```kotlin
+flow { emit(1); emit(2) }          // 自定义,最灵活
+flowOf(1, 2, 3)                    // 固定几个值
+listOf(1, 2, 3).asFlow()           // 集合转 Flow
+callbackFlow { ... }               // 把回调式 API 转成 Flow
+```
+
+## 冷流
+
+普通`Flow`是**冷流（Cold Flow）**
+
+- **没人 `collect`,里面的代码就不会执行。**
+- **每个收集者都会触发一次独立的执行。**
+
+```kotlin
+val f = flow {
+    println("开始生产")
+    emit(1)
+}
+
+f.collect { }   // 打印一次"开始生产"
+f.collect { }   // 再打印一次"开始生产"(重新执行)
+```
+
+可以类比为"点播视频":谁点开谁就从头播一遍。对应的是**热流**(像直播,不管有没有人看都在发),下一节的 `StateFlow` / `SharedFlow` 就是热流。
+
+## 常用操作符
+
+```kotlin
+flowOf(1, 2, 3, 4, 5)
+    .filter { it % 2 == 1 }        // 过滤:1, 3, 5
+    .map { it * 10 }               // 转换:10, 30, 50
+    .take(2)                       // 只取前 2 个:10, 30
+    .collect { println(it) }
+```
+
+| 操作符                     | 作用                                        |
+| -------------------------- | ------------------------------------------- |
+| `map` / `filter`           | 转换 / 过滤                                 |
+| `take` / `drop`            | 取前 N 个 / 丢弃前 N 个                     |
+| `onEach`                   | 对每个值做副作用(如打日志),不改变值         |
+| `distinctUntilChanged`     | 连续相同的值只发一次                        |
+| `debounce`                 | 防抖:一段时间内没有新值才发(搜索框常用)     |
+| `combine` / `zip`          | 合并多个 Flow                               |
+| `flatMapLatest`            | 新值到来时取消上一个内部 Flow(搜索联想常用) |
+| `catch`                    | 捕获上游异常                                |
+| `onStart` / `onCompletion` | 开始前 / 结束后回调                         |
+| `flowOn`                   | 切换上游执行的线程                          |
+| `stateIn` / `shareIn`      | 冷流转热流                                  |
+
+实例：搜索框
+
+```kotlin
+val query = MutableStateFlow("")
+
+val results: StateFlow<List<Item>> = query
+    .debounce(300)                          // 停止输入 300ms 后再搜
+    .distinctUntilChanged()                 // 内容没变就不重复搜
+    .flatMapLatest { keyword ->             // 新搜索来了,取消旧的请求
+        repo.search(keyword)                // 返回 Flow<List<Item>>
+    }
+    .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+```
+
+几行就实现了防抖、去重、取消过期请求,这是 Flow 的强项。
+
+## 热流
+
+### StateFlow
+
+状态
+
+```kotlin
+private val _count = MutableStateFlow(0)       // 必须有初始值
+val count: StateFlow<Int> = _count.asStateFlow()
+
+_count.value += 1                               // 更新
+```
+
+特点:
+
+- **永远有当前值**(`.value` 可直接读取)。
+- 新订阅者立刻收到最新值。
+- 自带 `distinctUntilChanged`:设置相同的值不会重复发出。
+- 适合表示 **UI 状态**。
+
+### SharedFlow
+
+事件
+
+```kotlin
+private val _events = MutableSharedFlow<Event>()
+val events: SharedFlow<Event> = _events.asSharedFlow()
+
+viewModelScope.launch { _events.emit(Event.ShowToast("保存成功")) }
+```
+
+特点:
+
+- 没有"当前值"的概念,默认不重放历史值(`replay = 0`)。
+- 不去重,每次 `emit` 都会通知订阅者。
+- 适合表示**一次性事件**(Toast、导航),但要注意没有订阅者时发出的事件会丢失,需要的话可用 `Channel` 或设置缓冲。
+
+在Android中安全地收集Flow
+
+```kotlin
+@Composable
+fun Screen(vm: MyViewModel = hiltViewModel()) {
+    val state by vm.uiState.collectAsStateWithLifecycle()
+    // 使用 state
+}
+```
+
+`collectAsStateWithLifecycle()` 会在页面进入后台(低于 `STARTED`)时**自动停止收集**,回到前台再恢复,避免浪费资源。

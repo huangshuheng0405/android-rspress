@@ -1,0 +1,132 @@
+# Coroutine
+
+**协程(Coroutine)** 是 Kotlin 提供的**轻量级异步编程方案**:让你用**顺序书写的同步风格代码**,完成耗时、异步的操作(网络请求、读写数据库、文件 I/O),而不阻塞主线程。
+
+它要解决的问题:Android 要求主线程不能做耗时操作(会卡顿、ANR),但耗时操作的结果又要回到主线程更新 UI。
+
+传统回调写法
+
+```kotlin
+// 回调地狱
+api.getUser(id, object : Callback<User> {
+    override fun onSuccess(user: User) {
+        api.getOrders(user.id, object : Callback<List<Order>> {
+            override fun onSuccess(orders: List<Order>) {
+                runOnUiThread { show(orders) }
+            }
+            override fun onError(e: Throwable) { ... }
+        })
+    }
+    override fun onError(e: Throwable) { ... }
+})
+```
+
+协程写法
+
+```kotlin
+viewModelScope.launch {
+    try {
+        val user = api.getUser(id)            // 挂起,不阻塞主线程
+        val orders = api.getOrders(user.id)   // 上一步完成后继续
+        show(orders)                          // 回到主线程
+    } catch (e: Exception) {
+        showError(e)
+    }
+}
+```
+
+看起来是同步代码,实际是异步执行,异常处理也和普通代码一样用 `try/catch`。
+
+## 协程 VS 线程
+
+|          | 线程                    | 协程                          |
+| -------- | ----------------------- | ----------------------------- |
+| 调度者   | 操作系统                | Kotlin 运行时(在线程之上调度) |
+| 创建成本 | 高(每个线程占用栈内存)  | 极低,可以同时开成千上万个     |
+| 阻塞时   | 线程被占住,什么也干不了 | 挂起,线程被释放去干别的事     |
+| 切换开销 | 较大(内核态)            | 很小                          |
+| 取消     | 困难                    | 内置结构化取消                |
+
+要点:**协程不是取代线程,而是运行在线程之上。** 一个线程可以轮流运行很多协程,协程挂起时让出线程。
+
+## suspend
+
+suspend函数
+
+```kotlin
+suspend fun fetchUser(id: Int): User {
+    delay(1000)                 // 挂起 1 秒,期间线程可以做别的事
+    return api.getUser(id)
+}
+```
+
+- `suspend` 标记的函数**可以挂起**:执行到耗时点时暂停,等结果好了再从暂停处继续。
+- **挂起 ≠ 阻塞。** `Thread.sleep(1000)` 会把线程卡死;`delay(1000)` 只是暂停当前协程,线程可以去执行其他协程。
+- `suspend` 函数只能在**协程**或**另一个 suspend 函数**中调用。
+- 本身不会自动切线程,`suspend` 只表示"可以挂起",在哪个线程跑取决于调用它的协程上下文。
+
+## 启动协程
+
+```kotlin
+// launch:启动一个协程,不关心返回值,返回 Job
+val job = scope.launch {
+    doWork()
+}
+
+// async:启动一个协程,有返回值,返回 Deferred<T>,用 await() 取结果
+val deferred = scope.async {
+    computeValue()
+}
+val result = deferred.await()
+
+// runBlocking:阻塞当前线程直到完成,主要用于测试和 main 函数,Android 业务代码不要用
+runBlocking { ... }
+```
+
+## Dispatch
+
+调度器（Dispatch）：决定在哪个线程运行
+
+| Dispatcher               | 线程                    | 用途                               |
+| ------------------------ | ----------------------- | ---------------------------------- |
+| `Dispatchers.Main`       | 主线程                  | 更新 UI、轻量操作                  |
+| `Dispatchers.IO`         | 共享的 I/O 线程池       | 网络、文件、数据库                 |
+| `Dispatchers.Default`    | 与 CPU 核数相当的线程池 | CPU 密集计算(排序、解析、图像处理) |
+| `Dispatchers.Unconfined` | 不限定                  | 特殊场景,一般不用                  |
+
+### withContext
+
+切换线程
+
+```kotlin
+suspend fun loadData(): List<Item> = withContext(Dispatchers.IO) {
+    // 在 IO 线程执行
+    dao.getAll()
+}
+
+viewModelScope.launch {                 // 默认在 Main
+    val items = loadData()              // 内部切到 IO,完成后自动回到 Main
+    _uiState.value = items              // 回到主线程更新
+}
+```
+
+`withContext` 会挂起当前协程,在指定的调度器上执行代码块,结束后切回原来的调度器。这是协程里切线程的标准做法。
+
+### 主线程安全的约定
+
+**suspend 函数应该做到"主线程安全"**:调用方可以在主线程直接调用它,函数内部自己负责切线程。
+
+```kotlin
+class UserRepository(private val api: Api, private val io: CoroutineDispatcher = Dispatchers.IO) {
+    // 调用方不需要关心线程
+    suspend fun getUser(id: Int): User = withContext(io) { api.getUser(id) }
+}
+```
+
+把 `Dispatcher` 作为构造参数注入,测试时可以替换成测试调度器。
+
+> 提示:Retrofit 和 Room 的 `suspend` 方法本身已经是主线程安全的,不需要再套 `withContext(Dispatchers.IO)`。
+
+## Scope
+
+见[CoroutineScope](/kotlin/coroutineScope)

@@ -27,15 +27,15 @@ ViewModel.onCleared()  ──► ViewModel 被销毁
 
 > 注意:**进程被系统杀死时 ViewModel 也会丢失**,这时需要用 `SavedStateHandle` 或持久化存储。
 
-## 基本语法
+## 用法
 
 定义ViewModel（配合StateFlow）
 
 ```kotlin
 class CounterViewModel : ViewModel() {
 
-    private val _count = MutableStateFlow(0)
-    val count: StateFlow<Int> = _count.asStateFlow()
+    private val _count = MutableStateFlow(0)         // 可读写
+    val count: StateFlow<Int> = _count.asStateFlow() // 只读 UI层不能修改
 
     fun increment() {
         _count.value += 1
@@ -72,7 +72,7 @@ class MainActivity : AppCompatActivity() {
 ```kotlin
 @Composable
 fun CounterScreen(viewModel: CounterViewModel = viewModel()) {
-    val count by viewModel.count.collectAsStateWithLifecycle()
+    val count by viewModel.count.collectAsStateWithLifecycle() // UI 订阅
 
     Button(onClick = { viewModel.increment() }) {
         Text("Count: $count")
@@ -149,3 +149,117 @@ sealed interface UiState {
 | 初始值       | 可无       | 必须有                                                     |
 | 操作符       | 较少       | 丰富(map、combine、debounce 等)                            |
 | 推荐度       | 老项目常见 | **新项目推荐**                                             |
+
+## SharedFlow
+
+`SharedFlow` 是**热流**：数据在流内部产生，与有没有订阅者无关。它天生支持**一对多广播**，一份数据可以同时发给多个订阅者。
+
+和 `StateFlow` 最大的区别是：它表达的是**“发生了一件事”**，而不是**“当前是什么状态”**。所以它没有初始值，也不做去重，默认也不保留历史值。
+
+### 与 StateFlow 的区别
+
+|              | StateFlow                   | SharedFlow                            |
+| ------------ | --------------------------- | ------------------------------------- |
+| 初始值       | 必须有                      | 没有这个概念                          |
+| 粘性（重放） | 有，等价于 `replay = 1`     | 默认 `replay = 0`，新订阅者收不到旧值 |
+| 去重         | 自动 `distinctUntilChanged` | 不去重，相同值也会再发一次            |
+| 读取当前值   | 有 `.value`                 | 没有 `.value`                         |
+| 典型用途     | UI 状态（加载中、列表数据） | 一次性事件（Toast、导航、弹窗）       |
+
+### 基本用法
+
+```kotlin
+class LoginViewModel : ViewModel() {
+
+    // replay = 0：新订阅者不会收到之前发过的事件
+    private val _events = MutableSharedFlow<LoginEvent>()
+    val events: SharedFlow<LoginEvent> = _events.asSharedFlow() // 对外只读
+
+    fun login(name: String) {
+        viewModelScope.launch {
+            _events.emit(LoginEvent.Loading)
+            runCatching { repo.login(name) }
+                .onSuccess { _events.emit(LoginEvent.Success(it.token)) }
+                .onFailure { _events.emit(LoginEvent.Error(it.message)) }
+        }
+    }
+}
+
+sealed interface LoginEvent {
+    data object Loading : LoginEvent
+    data class Success(val token: String) : LoginEvent
+    data class Error(val msg: String?) : LoginEvent
+}
+```
+
+UI 层收集：
+
+```kotlin
+// Activity / Fragment
+lifecycleScope.launch {
+    repeatOnLifecycle(Lifecycle.State.STARTED) {
+        viewModel.events.collect { event ->
+            when (event) {
+                is LoginEvent.Success -> navigateToHome()
+                is LoginEvent.Error -> toast(event.msg)
+                LoginEvent.Loading -> showLoading()
+            }
+        }
+    }
+}
+
+// Compose
+LaunchedEffect(Unit) {
+    viewModel.events.collect { event -> /* 处理事件 */ }
+}
+```
+
+### 构造参数
+
+`MutableSharedFlow<T>(replay, extraBufferCapacity, onBufferOverflow)`
+
+| 参数                  | 默认值                   | 作用                                   |
+| --------------------- | ------------------------ | -------------------------------------- |
+| `replay`              | `0`                      | 给新订阅者补发最近 n 个值              |
+| `extraBufferCapacity` | `0`                      | 在 replay 之外再额外缓冲多少个值       |
+| `onBufferOverflow`    | `BufferOverflow.SUSPEND` | 缓冲满时的策略：挂起 / 丢最旧 / 丢最新 |
+
+三个参数的实际影响：
+
+- `replay = 0` + `extraBufferCapacity = 0`（默认）：`emit` 是挂起的，必须等所有订阅者处理完。此时**没有任何缓冲**，事件在没人订阅时直接丢失。
+- 想让 `emit` 不阻塞、改用 `tryEmit`：必须给它缓冲，即 `replay + extraBufferCapacity > 0`，否则 `tryEmit` 基本都返回 `false`，事件被静默丢掉。
+- `onBufferOverflow` 只有缓冲区容量大于 0 时才生效，否则构造 `MutableSharedFlow` 时会直接抛 `IllegalArgumentException`。
+
+### 一次性事件的坑
+
+用 `SharedFlow` 处理 Toast、Snackbar、导航这类事件时，`replay` 必须保持 `0`。一旦设成 `1` 或更大，屏幕旋转、返回栈重建后，新订阅者会**重新收到旧事件**，出现“转屏后 Toast 又弹一次”“返回上一页又跳一次详情”的诡异问题。
+
+反过来，`replay = 0` 也有代价：**事件发出时没有订阅者，就永久丢失**。比如在 `ViewModel.init` 里 emit 一个错误，而 UI 还没来得及 collect，这条事件就没了。
+
+如果事件必须保证送达（且只被消费一次），用 `Channel` 更合适：
+
+|          | Channel                        | SharedFlow                       |
+| -------- | ------------------------------ | -------------------------------- |
+| 消费模型 | 一对一，被消费后就没了         | 一对多广播，每个订阅者都收到一份 |
+| 生命周期 | 需要 `close()`                 | 随作用域，没有 close 的概念      |
+| 适用场景 | 严格的一次性事件（导航、弹窗） | 多观察者需要同时感知的事件       |
+
+`Channel` 的常见写法：
+
+```kotlin
+private val _events = Channel<LoginEvent>(Channel.BUFFERED)
+val events = _events.receiveAsFlow()
+
+// 发送
+_events.send(LoginEvent.Error("账号或密码错误"))
+```
+
+> 简单记：**状态用 StateFlow，广播用 SharedFlow，一次性事件优先 Channel**。
+
+## collectAsStateWithLifecycle
+
+与`collectAsState`的区别
+
+`collectAsState` 是平台无关的（位于 `compose-runtime`），它**不感知 Android 生命周期**。这意味着，即使你的 Composable 进入了后台、界面不可见了，它依然会持续从 `Flow` 收集数据。这会造成不必要的后台资源消耗和性能问题。
+
+`collectAsStateWithLifecycle` 则专为 Android 设计（位于 `lifecycle-runtime-compose`），它会遵循宿主 Activity/Fragment 的生命周期。当 UI 离开活跃状态（例如进入后台、屏幕旋转或导航离开）时，**收集会自动暂停**；当 UI 重新回到前台时，又会恢复收集。这不仅节省了资源，也避免了潜在的内存泄漏风险。

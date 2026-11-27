@@ -2,7 +2,7 @@
   {
     "type": "file",
     "name": "index",
-    "label": "Android 概览"
+    "label": "Overview"
   },
   {
     "type": "file",
@@ -28,5 +28,15 @@
     "type": "file",
     "name": "store",
     "label": "Store"
+  },
+  {
+    "type": "file",
+    "name": "okHttp",
+    "label": "OkHttp"
+  },
+  {
+    "type": "file",
+    "name": "retrofit",
+    "label": "Retrofit"
   }
 ]

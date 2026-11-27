@@ -1,0 +1,167 @@
+# Retrofit
+
+Retrofit不发网路请求，发请求的是OkHttp。Retrofit做的是把一个Kotlin接口方法翻译成一次OkHttp请求，再把响应翻译会Kotlin对象
+
+## 接口方法与路径
+
+```kotlin
+interface NoteApi {
+    @GET("notes")                          // 相对路径,拼在 baseUrl 后面
+    suspend fun getNotes(): List<NoteDto>
+
+    @HTTP(method = "DELETE", path = "notes/{id}", hasBody = true)   // 自定义方法(如带 Body 的 DELETE)
+    suspend fun deleteWithBody(@Path("id") id: Long, @Body reason: ReasonDto)
+}
+```
+
+内置:`@GET`、`@POST`、`@PUT`、`@PATCH`、`@DELETE`、`@HEAD`、`@OPTIONS`,以及通用的 `@HTTP`。
+
+**URL相关参数**
+
+| 注解         | 作用                          | 示例                         |
+| ------------ | ----------------------------- | ---------------------------- |
+| `@Path`      | 替换路径中的 `{占位符}`       | `notes/{id}`                 |
+| `@Query`     | 追加查询参数                  | `?page=1`                    |
+| `@QueryMap`  | 批量查询参数                  | `Map<String, String>`        |
+| `@QueryName` | 只有名字没有值的参数          | `?flag`                      |
+| `@Url`       | 直接指定完整 URL,忽略 baseUrl | 分页的 `next` 链接、下载地址 |
+
+```kotlin
+@GET("notes")
+suspend fun search(
+    @Query("keyword") keyword: String?,                // 传 null 则该参数被省略
+    @Query("tag") tags: List<String>,                  // 重复参数:?tag=a&tag=b
+    @QueryMap filters: Map<String, String> = emptyMap()
+): List<NoteDto>
+
+@GET("notes/{id}/comments")
+suspend fun comments(@Path("id") id: Long): List<CommentDto>
+
+@GET
+suspend fun fetchByUrl(@Url url: String): List<NoteDto>
+```
+
+细节:
+
+- `@Query` 的值默认会做 URL 编码;已经编码好的字符串用 `@Query(value = "x", encoded = true)`,避免二次编码。
+- `@Path` 的值默认也会编码,斜杠 `/` 会被编码成 `%2F`;确实要传带斜杠的路径,用 `@Path(value = "p", encoded = true)`。
+- `@Url` 必须是方法的**第一个参数**;它如果是相对地址,会基于 baseUrl 解析。
+
+## Header
+
+```kotlin
+@Headers("Accept: application/json", "X-Client: android")      // 固定头
+@GET("notes")
+suspend fun getNotes(@Header("Authorization") token: String): List<NoteDto>   // 动态头
+
+@GET("notes")
+suspend fun withMap(@HeaderMap headers: Map<String, String>): List<NoteDto>
+```
+
+全局统一的头(Token、设备信息)请放在 **OkHttp 拦截器**里,不要在每个方法上都传。
+
+## 请求体
+
+```kotlin
+// JSON 请求体:由 Converter 序列化
+@POST("notes")
+suspend fun create(@Body request: CreateNoteRequest): NoteDto
+
+// 表单
+@FormUrlEncoded
+@POST("login")
+suspend fun login(
+    @Field("username") username: String,
+    @Field("password") password: String
+): TokenDto
+
+// 文件上传
+@Multipart
+@POST("upload")
+suspend fun upload(
+    @Part file: MultipartBody.Part,
+    @Part("description") description: RequestBody,
+    @PartMap extras: Map<String, @JvmSuppressWildcards RequestBody> = emptyMap()
+): UploadResponse
+```
+
+注意:
+
+- `@Body`、`@FormUrlEncoded`、`@Multipart` **三者互斥**,一个方法只能用其中一种。
+- `@Body` 传 `RequestBody` 时不会再经过 Converter,直接使用。
+- `@Multipart` 中,`@Part("name") String` 会让 Converter 把字符串序列化,**JSON 转换器会给字符串加上引号**,导致服务器收到 `"\"hello\""`。解决办法:用 `RequestBody` 手动构造,或为 Retrofit 额外加 **Scalars 转换器**。
+
+## 返回类型
+
+```kotlin
+// ① 直接返回 T:2xx 返回数据,其他情况抛异常
+@GET("notes/{id}") suspend fun getNote(@Path("id") id: Long): NoteDto
+
+// ② Response<T>:不对 HTTP 错误抛异常,可以拿状态码和错误体
+@GET("notes/{id}") suspend fun getNoteRaw(@Path("id") id: Long): Response<NoteDto>
+
+// ③ Unit:不关心响应内容(如 DELETE、204)
+@DELETE("notes/{id}") suspend fun delete(@Path("id") id: Long)
+
+// ④ ResponseBody:拿原始响应体(下载文件)
+@Streaming @GET suspend fun download(@Url url: String): ResponseBody
+
+// ⑤ Call<T>:传统写法,不是 suspend,自己 enqueue 或 execute
+@GET("notes") fun getNotesCall(): Call<List<NoteDto>>
+```
+
+## Converter
+
+负责对象$\leftrightarrow$HTTP请求/响应体
+
+可用转换器
+
+| 转换器                   | 说明                                                         |
+| ------------------------ | ------------------------------------------------------------ |
+| **Kotlin Serialization** | 官方推荐给 Kotlin 项目,编译期生成序列化代码,无反射           |
+| **Moshi**                | Square 出品,对 Kotlin 支持好(配合 codegen)                   |
+| **Gson**                 | 老牌,但对 Kotlin 的空安全、默认值**不友好**(会绕过构造函数,非空字段可能是 null) |
+| **Jackson**              | 功能强大,Android 上相对少用                                  |
+| **Scalars**              | 处理 `String`、基本类型、`ResponseBody`                      |
+| **Protobuf / Wire**      | Protocol Buffers                                             |
+
+### 多个转换器
+
+Retrofit会按添加顺序逐个询问，“你能处理这个类型吗”，第一个能用的就用它
+
+```kotlin
+Retrofit.Builder()
+    .addConverterFactory(ScalarsConverterFactory.create())       // 先:处理 String 等
+    .addConverterFactory(json.asConverterFactory("application/json".toMediaType()))   // 后:处理对象
+```
+
+Scalars 放前面,是为了让返回/传入 `String` 时不被 JSON 转换器套上引号。
+
+### Kotlin Serialization
+
+注意点
+
+```kotlin
+val json = Json {
+    ignoreUnknownKeys = true      // 服务器加字段不会崩
+    coerceInputValues = true      // JSON 里的 null 遇到非空且有默认值的属性时用默认值
+    explicitNulls = false         // 序列化时不输出 null 字段
+    isLenient = false             // 通常保持严格
+}
+```
+
+## 多个baseUrl
+
+多个Retrofit实例，共享同一个OkHttpClient
+
+```kotlin
+@Provides @Singleton @MainApi
+fun provideMainRetrofit(client: OkHttpClient, json: Json): Retrofit =
+    Retrofit.Builder().baseUrl("https://api.example.com/").client(client).addConverterFactory(...).build()
+
+@Provides @Singleton @PayApi
+fun providePayRetrofit(client: OkHttpClient, json: Json): Retrofit =
+    Retrofit.Builder().baseUrl("https://pay.example.com/").client(client).addConverterFactory(...).build()
+```
+
+用 `@Qualifier` 区分(参考 Hilt 篇)。Retrofit 实例很轻,**重的是 OkHttpClient**,共享它就不会浪费连接池。

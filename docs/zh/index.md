@@ -13,6 +13,9 @@ hero:
     - theme: alt
       text: GitHub
       link: https://github.com/web-infra-dev/rspress
+    - theme: alt
+      text: Android
+      link: /zh/android/index
   image:
     src: /rspress-icon.png
     alt: Logo
